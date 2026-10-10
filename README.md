@@ -149,5 +149,4 @@ primarily been performed with a Korg X2.
 
 ## License
 
-A license has not yet been specified. Add a `LICENSE` file before
-defining redistribution or contribution terms.
+SyX2tool is released under the **MIT License**. See the `LICENSE` file for details.
