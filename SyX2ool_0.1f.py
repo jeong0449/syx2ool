@@ -1,0 +1,1183 @@
+#!/usr/bin/env python3
+"""
+SyX2ool v0.1e — Korg X2/X3 SysEx & MIDI Toolkit
+
+Subcommands
+-----------
+  import   Standard MIDI File -> X2/X3 ALL SEQUENCE DATA dump
+  export   X2/X3 ALL SEQUENCE DATA dump -> SMF
+  analyze  Inspect Songs, Tracks and User Patterns in a dump
+  play     Play an SMF or an X2/X3 User Pattern through MIDI OUT
+
+Run:
+  python syx2ool.py -h
+  python syx2ool.py import -h
+  python syx2ool.py export -h
+  python syx2ool.py analyze -h
+  python syx2ool.py play -h
+
+v0.1 notes
+-----------
+* Import is based on the hardware-tested SMF->X2 converter:
+  Format 0, 96 PPQN, constant 4/4, constant tempo.
+* Default import target is S9. --song may select S0..S9.
+* Export accepts comma/range syntax such as 0,3,9 or 0-3,7,9.
+* Song export produces SMF Format 1.
+* Pattern export preserves X2/X3 note numbers; it does NOT remap drums to GM.
+* Pattern Put expansion is not implemented yet. Unknown events are warned about.
+"""
+
+import argparse
+import io
+import time
+import base64
+import re
+import struct
+import sys
+import zlib
+from collections import defaultdict, deque
+from pathlib import Path
+
+try:
+    import mido
+except ImportError:
+    mido = None
+
+VERSION = "0.1f"
+PPQN = 96
+CONTROL_SIZE = 3702
+SONG_CTL_SIZE = 296
+SONG_ADDR_OFF = 3160
+PATTERN_ADDR_OFF = 3500
+PATTERN_END_OFF = 3700
+SEQ_BASE_BLOCK = 4288
+
+_EMPTY_SEQUENCE_ZLIB_B64 = "eNrtljtvE0EUhc88dr3ep4VBQjTZpIqoaOii2IpcUCGkiCYVkh3RhTJVtH+ZjpaZuev1PYlFRQVeKzseaf3l3k/3jPbnzYePnxAvY53PcsyKeVnVDdrOxQvOHVZrLWy6MK7L4g4YPt8/or/98fC97+HNchcubDarVzi7qq8xPAFblA7v4H38Tzug6y8GDGY17i6GIu5M3MQdBmtWNu7W3figkwcXaef3P4MPu+zwM2NWuebP9g9exl2BXQGc9cKfE7/U/Ir4NfEbzW+p/k76w9bYvVFkeTKKuklGyWcwOnoMq3zr7TIZxf1jMoq+T0ax2yWjH86uxCi2yago1fWRX0P1WfLrqH+v+8+o/5z4M80vzuMuGE38OfFL4leaXxO/IX6r+d04MlskpeEWhzQYRRzSYPSZz7DufR7+olEThzQYRRzSYBRxSIPRdRzSYNQ8iVEa0rE+9mt0fZb8OurfU/+Z7j8n/kzxszikweh5P4hRzS+JXxG/1vyG+C3Vf2RIg1FI7Ft07kXu7ZT7/ZQu77zEvofE3kNiv4HE/jqX2Jfg2I/1sV9D9Vnt11H/nvrPqP9c86fY47XEPox3ir0Zh3TPL4lfEb8mfqP5LdV/zCgk9jUk9s/m1B5yP35ZSOzvIbHvIbEPuZeD9C3H3mOM/VQf+TVUnyW/Tvfvqf+M+s+JL7G/+CKxx0Jin/hz4peaXxG/Jn5D/FbX30l/wSgk9g4S+xIS+5e5n85RUbuW2A+Q2D9AYh/P0WT0G/58kNox9lN9Rtdnya+j/r3uP6P+c+LPNP9GYt8vOPaJXxK/0vya+A3xW6qfhzR4lYMUEvvu5TnqpnN0khqMWon9LST2BhL7DST2cMPxg7QAH6R2jP1Un9V+HfXvqf9M958TXx2kpcQeNxL7FeaaXxK/In6t+Q3xW6r/6EF6en86vT+d3p/+m/enZXjvSR/I8s/tL8NtvVgvvsZb+LyX5bQ/7f/q/o0sv34DPh4NaQ=="
+EMPTY_SEQUENCE_SYX = zlib.decompress(base64.b64decode(_EMPTY_SEQUENCE_ZLIB_B64))
+assert len(EMPTY_SEQUENCE_SYX) == 4240
+
+# Empirically captured S9 control block after GM System On on the X2.
+# 296 bytes.  This makes the generated S9 GM-conformed without requiring
+# a separate GM System On message before loading the sequence dump.
+GM_SONG_CONTROL = bytes.fromhex(
+    "000102030405060708090a0b0c0d0e0f03030303030303030303030303030303020202020202020202000202020202021346000000504859534943414c20200401136464646444443f12001f3c3e00fffd0000630a03001a0004040000006400000f227f007f01bf00006400000f227f007f01bf01006400000f227f007f01bf02006400000f227f007f01bf03006400000f227f007f01bf04006400000f227f007f01bf05006400000f227f007f01bf06006400000f227f007f01bf07006400000f227f007f01bf08806400001fa07f007f01bf09006400000f227f007f01bf0a006400000f227f007f01bf0b006400000f227f007f01bf0c006400000f227f007f01bf0d006400000f227f007f01bf0e006400000f227f007f01bf0f0404000000006301020000"
+)
+assert len(GM_SONG_CONTROL) == 296
+
+# ---------- Korg packing / 48H container ----------
+
+def unpack7(d):
+    out = bytearray()
+    i = 0
+    while i < len(d):
+        msb = d[i]
+        i += 1
+        for bit in range(7):
+            if i >= len(d):
+                break
+            out.append(d[i] | (((msb >> bit) & 1) << 7))
+            i += 1
+    return bytes(out)
+
+
+def pack7(d):
+    out = bytearray()
+    for i in range(0, len(d), 7):
+        chunk = d[i:i+7]
+        msb = 0
+        low = bytearray()
+        for bit, b in enumerate(chunk):
+            if b & 0x80:
+                msb |= 1 << bit
+            low.append(b & 0x7F)
+        out.append(msb)
+        out.extend(low)
+    return bytes(out)
+
+
+def load_48h(path):
+    b = Path(path).read_bytes()
+    pos = -1
+    for i in range(max(0, len(b) - 8)):
+        if (b[i:i+2] == b"\xF0\x42" and (b[i+2] & 0xF0) == 0x30
+                and b[i+3:i+6] == bytes((0x35, 0x48, 0x00))):
+            pos = i
+            break
+    if pos < 0:
+        raise ValueError("X2/X3 48H ALL SEQUENCE DATA DUMP not found")
+    end = b.find(b"\xF7", pos)
+    if end < 0:
+        raise ValueError("SysEx terminator F7 not found")
+    msg = b[pos:end+1]
+    if len(msg) < 9:
+        raise ValueError("48H message is too short")
+    blocks = msg[6] | (msg[7] << 7)
+    raw = unpack7(msg[8:-1])
+    if len(raw) < CONTROL_SIZE:
+        raise ValueError("unpacked payload is shorter than 3702-byte Control Data")
+    ctl = bytearray(raw[:CONTROL_SIZE])
+    seq = raw[CONTROL_SIZE:]
+    if len(seq) != blocks * 16:
+        raise ValueError(
+            f"sequence size mismatch: header={blocks} blocks, payload={len(seq)//16} blocks"
+        )
+    return bytearray(msg[:6]), ctl, seq
+
+
+def make_48h(header6, ctl, seq):
+    if len(seq) % 16:
+        raise ValueError("Sequence Data must be a multiple of 16 bytes")
+    blocks = len(seq) // 16
+    if blocks > 0x3FFF:
+        raise ValueError("Sequence Data exceeds 14-bit block count")
+    out = bytearray(header6)
+    out += bytes((blocks & 0x7F, (blocks >> 7) & 0x7F))
+    out += pack7(bytes(ctl) + bytes(seq))
+    out.append(0xF7)
+    return bytes(out)
+
+
+# ---------- address / selection helpers ----------
+
+def song_addresses(ctl, s):
+    off = SONG_ADDR_OFF + s * 34
+    return [int.from_bytes(ctl[off+2*i:off+2*i+2], "little") for i in range(17)]
+
+
+def put_song_addresses(ctl, s, values):
+    off = SONG_ADDR_OFF + s * 34
+    for i, v in enumerate(values):
+        ctl[off+2*i:off+2*i+2] = int(v).to_bytes(2, "little")
+
+
+def pattern_address(ctl, p):
+    off = PATTERN_ADDR_OFF + p * 2
+    return int.from_bytes(ctl[off:off+2], "little")
+
+
+def pattern_end(ctl):
+    return int.from_bytes(ctl[PATTERN_END_OFF:PATTERN_END_OFF+2], "little")
+
+
+def song_end_address(ctl, s):
+    return song_addresses(ctl, s+1)[0] if s < 9 else pattern_address(ctl, 0)
+
+
+def song_name(ctl, s):
+    off = s * SONG_CTL_SIZE + 53
+    raw = bytes(ctl[off:off+10])
+    txt = "".join(chr(x) if 32 <= x < 127 else " " for x in raw).strip()
+    return txt or f"S{s}"
+
+
+def song_tempo(ctl, s):
+    return int(ctl[s * SONG_CTL_SIZE + 49]) + 30
+
+
+def song_channels(ctl, s):
+    base = s * SONG_CTL_SIZE
+    return [ctl[base+i] & 0x0F for i in range(16)]
+
+
+def song_has_data(ctl, s):
+    a = song_addresses(ctl, s)
+    return any(a[t] < (a[t+1] if t < 15 else a[16]) for t in range(16))
+
+
+def pattern_has_data(ctl, p):
+    a = pattern_address(ctl, p)
+    z = pattern_address(ctl, p+1) if p < 99 else pattern_end(ctl)
+    return a < z
+
+
+def parse_selector(text, lo, hi, label):
+    """Parse N, N,M,K, N-M, or mixed forms such as 0-3,7,9."""
+    if text is None:
+        return []
+    result = []
+    seen = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            raise ValueError(f"empty item in {label} selector")
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not m:
+            raise ValueError(f"invalid {label} selector: {part!r}")
+        a = int(m.group(1))
+        b = int(m.group(2)) if m.group(2) is not None else a
+        if a > b:
+            raise ValueError(f"reversed {label} range: {part}")
+        if a < lo or b > hi:
+            raise ValueError(f"{label} must be in {lo}..{hi}: {part}")
+        for n in range(a, b+1):
+            if n not in seen:
+                seen.add(n)
+                result.append(n)
+    return result
+
+
+def seq_slice(seq, start_block, end_block):
+    if end_block <= start_block:
+        return b""
+    a = (start_block - SEQ_BASE_BLOCK) * 16
+    z = (end_block - SEQ_BASE_BLOCK) * 16
+    if a < 0 or z < 0 or z > len(seq):
+        raise ValueError(
+            f"address outside Sequence Data: blocks {start_block}..{end_block}"
+        )
+    return bytes(seq[a:z])
+
+
+# ---------- forward SMF -> X2 events ----------
+
+def require_mido():
+    if mido is None:
+        raise RuntimeError("mido is required. Install it with: pip install mido")
+
+
+def tt(t, base):
+    if not 0 <= t <= 0x1FF:
+        raise ValueError("event time out of range")
+    return bytes((t & 255, base | ((t >> 8) & 1)))
+
+
+def bar_ev(bar_no):
+    return bytes((bar_no & 255, 0x60 | ((bar_no >> 8) & 3), 0, 0x13))
+
+
+def end_ev(t, bar_no):
+    return bytes((t & 255, 0x70 | ((t >> 8) & 1),
+                  bar_no & 255, (bar_no >> 8) & 3))
+
+
+def pc_ev(t, p):
+    return tt(t, 0x30) + bytes((p & 127, 0x80))
+
+
+def cc_ev(t, c, v):
+    return tt(t, 0x40) + bytes((c & 127, v & 127))
+
+
+def pb_ev(t, p):
+    v = max(0, min(16383, p + 8192))
+    return tt(t, 0x10) + bytes((v & 127, (v >> 7) & 127))
+
+
+def note_ev(t, n, v, length):
+    if not 1 <= v <= 127:
+        raise ValueError(f"velocity out of range: {v}")
+    kv = max(2, min(126, ((v + 1) // 2) * 2))
+    return bytes((t & 255, 0x80 | kv | ((t >> 8) & 1),
+                  length & 255, ((n & 127) << 1) | ((length >> 8) & 1)))
+
+
+def read_midi_for_import(path):
+    require_mido()
+    m = mido.MidiFile(path)
+    if m.type != 0 or len(m.tracks) != 1:
+        raise ValueError("v0.1 import currently requires SMF Format 0")
+    if m.ticks_per_beat != PPQN:
+        raise ValueError("v0.1 import currently requires 96 PPQN")
+    tick = 0
+    ev = []
+    tempos = []
+    sig = []
+    for order, msg in enumerate(m.tracks[0]):
+        tick += msg.time
+        if msg.is_meta:
+            if msg.type == "set_tempo":
+                tempos.append((tick, msg.tempo))
+            elif msg.type == "time_signature":
+                sig.append((tick, msg.numerator, msg.denominator))
+        else:
+            ev.append((tick, order, msg))
+    if sig and any(t != 0 or n != 4 or d != 4 for t, n, d in sig):
+        raise ValueError("v0.1 import requires constant 4/4")
+    if len({x[1] for x in tempos}) > 1:
+        raise ValueError("v0.1 import does not yet support tempo changes")
+    return m, ev, tempos, tick
+
+
+def midi_song_name(midpath):
+    require_mido()
+    m = mido.MidiFile(midpath)
+    track_names, markers = [], []
+    for tr in m.tracks:
+        for msg in tr:
+            if not msg.is_meta:
+                continue
+            if msg.type == "track_name" and msg.name.strip():
+                track_names.append(msg.name.strip())
+            elif msg.type == "marker" and msg.text.strip():
+                markers.append(msg.text.strip())
+    if track_names:
+        title = track_names[0]
+    elif markers:
+        title = markers[0].split(";", 1)[0].strip()
+    else:
+        title = Path(midpath).stem
+    return title
+
+
+def x2_song_name_bytes(name):
+    return name.upper().encode("ascii", "replace")[:10].ljust(10, b" ")
+
+
+def make_x2_tracks(midpath):
+    m, ev, tempos, endtick = read_midi_for_import(midpath)
+    active = defaultdict(deque)
+    notes, other = [], []
+    for tick, order, msg in ev:
+        if msg.type == "note_on" and msg.velocity:
+            active[(msg.channel, msg.note)].append((tick, order, msg.velocity))
+        elif msg.type in ("note_off", "note_on") and (
+            msg.type == "note_off" or msg.velocity == 0
+        ):
+            q = active[(msg.channel, msg.note)]
+            if q:
+                st, so, vel = q.popleft()
+                notes.append((msg.channel, st, tick, so, msg.note, vel))
+        else:
+            other.append((tick, order, msg))
+    if any(active.values()):
+        raise ValueError("unclosed notes in input MIDI")
+
+    B = 384
+    last = endtick // B
+    et = endtick % B
+    if et == 0 and endtick:
+        last -= 1
+        et = B
+    per_ch = [[] for _ in range(16)]
+
+    for tick, order, msg in other:
+        if not hasattr(msg, "channel") or msg.channel >= 16:
+            continue
+        bar, t = divmod(tick, B)
+        if msg.type == "program_change":
+            data = pc_ev(t, msg.program)
+        elif msg.type == "control_change":
+            data = cc_ev(t, msg.control, msg.value)
+        elif msg.type == "pitchwheel":
+            data = pb_ev(t, msg.pitch)
+        else:
+            continue
+        per_ch[msg.channel].append((bar, t, order, data))
+
+    for ch, st, en, order, note, vel in notes:
+        cur = st
+        first = True
+        while cur < en:
+            bar = cur // B
+            boundary = (bar + 1) * B
+            stop = min(en, boundary)
+            t = (cur - bar * B) if first else 0x1FE
+            length = 0x1FE if en > boundary else stop - cur
+            per_ch[ch].append(
+                (bar, (cur - bar * B) if first else -1,
+                 order, note_ev(t, note, vel, length))
+            )
+            cur = stop
+            first = False
+
+    tracks, counts = [], []
+    for ch in range(16):
+        grouped = defaultdict(list)
+        for bar, t, order, data in per_ch[ch]:
+            grouped[bar].append((t, order, data))
+        raw = bytearray()
+        count = 0
+        for bar in range(last + 1):
+            raw += bar_ev(bar)
+            count += 1
+            for _, _, data in sorted(grouped.get(bar, []), key=lambda x: (x[0], x[1])):
+                raw += data
+                count += 1
+        raw += end_ev(et, last)
+        count += 1
+        while len(raw) % 16:
+            raw.append(0)
+        tracks.append(bytes(raw))
+        counts.append(count)
+
+    bpm = round(mido.tempo2bpm(tempos[0][1])) if tempos else 120
+    return tracks, counts, last + 1, bpm
+
+
+def import_song(args):
+    # Empty template or an existing workspace.
+    if args.template:
+        header, ctl, seq = load_48h(args.template)
+    else:
+        tmp = Path(args.output).with_suffix(".embedded-empty.tmp")
+        # Avoid writing the embedded image: parse it directly.
+        p = EMPTY_SEQUENCE_SYX
+        header = bytearray(p[:6])
+        blocks = p[6] | (p[7] << 7)
+        raw = unpack7(p[8:-1])
+        ctl = bytearray(raw[:CONTROL_SIZE])
+        seq = raw[CONTROL_SIZE:]
+        if len(seq) != blocks * 16:
+            raise ValueError("embedded empty dump size mismatch")
+
+    s = args.song
+    old_a = song_addresses(ctl, s)
+    old_start = old_a[0]
+    old_end = song_end_address(ctl, s)
+
+    tracks, counts, bars, bpm = make_x2_tracks(args.input)
+
+    # Build replacement Song Sequence Data: 16 tracks, empty tempo track.
+    cur = old_start
+    new_a = [cur]
+    blob = bytearray()
+    for tr in tracks:
+        blob += tr
+        cur += len(tr) // 16
+        new_a.append(cur)
+    new_end = cur
+
+    prefix = seq_slice(seq, SEQ_BASE_BLOCK, old_start)
+    suffix = seq_slice(seq, old_end, SEQ_BASE_BLOCK + len(seq)//16)
+    newseq = prefix + bytes(blob) + suffix
+    delta = new_end - old_end
+
+    # GM-conformed Song control state captured on real X2. The 296-byte Song
+    # control layout is slot-independent; then set tempo/name for the target.
+    base = s * SONG_CTL_SIZE
+    ctl[base:base+SONG_CTL_SIZE] = GM_SONG_CONTROL
+
+    # The captured GM Song control template happened to contain Next Song = S0
+    # (raw value 0x00).  Copying that value to S0 produced S0 -> S0 and
+    # prevented normal playback on the real X2.  Real-hardware tests confirmed
+    # that setting Next Song to OFF (0xFF) makes imported Songs work in S0 and
+    # S1.  A fresh import therefore starts with Song chaining disabled.
+    ctl[base+52] = 0xFF
+
+    ctl[base+49] = max(0, min(210, bpm - 30))
+    chosen = args.name if args.name is not None else midi_song_name(args.input)
+    ctl[base+53:base+63] = x2_song_name_bytes(chosen)
+    put_song_addresses(ctl, s, new_a)
+
+    # Shift all later Song address tables and all Pattern addresses.
+    for later in range(s + 1, 10):
+        vals = [v + delta for v in song_addresses(ctl, later)]
+        put_song_addresses(ctl, later, vals)
+
+    for p in range(100):
+        off = PATTERN_ADDR_OFF + 2*p
+        v = int.from_bytes(ctl[off:off+2], "little")
+        ctl[off:off+2] = (v + delta).to_bytes(2, "little")
+    pe = pattern_end(ctl) + delta
+    ctl[PATTERN_END_OFF:PATTERN_END_OFF+2] = pe.to_bytes(2, "little")
+
+    out = make_48h(header, ctl, newseq)
+    Path(args.output).write_bytes(out)
+
+    print(f"SyX2ool {VERSION} import")
+    print(f"  input       : {args.input}")
+    print(f"  output      : {args.output}")
+    print(f"  target      : S{s}")
+    print(f"  song name   : {song_name(ctl, s)}")
+    print(f"  tempo       : {bpm} BPM")
+    print(f"  bars        : {bars}")
+    print(f"  events      : {sum(counts)}")
+    print(f"  seq blocks  : {len(newseq)//16}")
+    print(f"  SysEx bytes : {len(out)}")
+
+
+# ---------- reverse X2 events -> SMF ----------
+
+def vlq(n):
+    n = max(0, int(n))
+    buf = [n & 0x7F]
+    n >>= 7
+    while n:
+        buf.append(0x80 | (n & 0x7F))
+        n >>= 7
+    return bytes(reversed(buf))
+
+
+def meta(delta, typ, payload=b""):
+    return vlq(delta) + bytes((0xFF, typ)) + vlq(len(payload)) + payload
+
+
+def midi_event(delta, status, data):
+    return vlq(delta) + bytes((status,)) + bytes(data)
+
+
+def decode_x2_events(raw, midi_ch, context="track"):
+    """
+    Decode X2/X3 native 4-byte sequence events to MIDI events.
+
+    v0.1b fixes tied notes that cross bar boundaries.
+
+    v0.1e also preserves the native Track End position so exported Patterns
+    retain their full measure length (important for seamless looping).  The X2 forward
+    converter represents such a note as one or more segments:
+
+      first segment:        normal event time, length = 0x1FE
+      continuation segment: event time = 0x1FE, length = 0x1FE or final length
+
+    A continuation is not a new Note On.  Keep the original note open and
+    emit one Note Off only when the final segment supplies a real length.
+    """
+    events = []
+    warnings = []
+    current_bar = 0
+    tied = defaultdict(list)  # note -> FIFO of open cross-bar note instances
+    end_tick = None
+
+    for off in range(0, len(raw) - 3, 4):
+        b0, b1, b2, b3 = raw[off:off+4]
+        if (b0, b1, b2, b3) == (0, 0, 0, 0):
+            continue
+
+        # Note event: DATA(1-H) = 1vvv vvvt.
+        # Must be tested before event-type nibbles because b1 may be F0..FE.
+        if b1 & 0x80:
+            t = b0 | ((b1 & 1) << 8)
+            vel = b1 & 0x7E
+            length = b2 | ((b3 & 1) << 8)
+            note = (b3 >> 1) & 0x7F
+            bar_tick = current_bar * 384
+
+            if t == 0x1FE:
+                # Continuation of a note begun in an earlier bar.
+                if not tied[note]:
+                    warnings.append(
+                        f"{context} +0x{off:04X}: orphan tied-note continuation "
+                        f"for note {note}"
+                    )
+                    # Best-effort recovery: start it at the bar boundary.
+                    events.append((bar_tick, 20, 0x90 | midi_ch, (note, vel)))
+                    tied[note].append(True)
+
+                # Continuations for repeated/overlapping notes of the same pitch
+                # occur in FIFO order in the native stream.
+                tied[note].pop(0)
+                if length == 0x1FE:
+                    tied[note].append(True)
+                else:
+                    events.append((bar_tick + length, 10,
+                                   0x80 | midi_ch, (note, 0)))
+                if not tied[note]:
+                    tied.pop(note, None)
+                continue
+
+            tick = bar_tick + t
+            events.append((tick, 20, 0x90 | midi_ch, (note, vel)))
+
+            if length == 0x1FE:
+                tied[note].append(True)
+            else:
+                events.append((tick + length, 10,
+                               0x80 | midi_ch, (note, 0)))
+            continue
+
+        typ = b1 & 0xF0
+
+        # BAR stores bar number, not event time.
+        if typ == 0x60:
+            current_bar = b0 | ((b1 & 0x03) << 8)
+            continue
+
+        # Track End stores both time-within-bar and bar number.  Preserve
+        # its absolute position even when the last musical event occurs earlier.
+        if typ == 0x70:
+            end_t = b0 | ((b1 & 0x01) << 8)
+            end_bar = b2 | ((b3 & 0x03) << 8)
+            end_tick = end_bar * 384 + end_t
+            continue
+
+        t = b0 | ((b1 & 1) << 8)
+        tick = current_bar * 384 + t
+
+        if typ == 0x10:  # Pitch Bend
+            events.append((tick, 30, 0xE0 | midi_ch, (b2 & 0x7F, b3 & 0x7F)))
+        elif typ == 0x20:  # Channel Aftertouch
+            events.append((tick, 30, 0xD0 | midi_ch, (b2 & 0x7F,)))
+        elif typ == 0x30:  # Program Change
+            events.append((tick, 30, 0xC0 | midi_ch, (b2 & 0x7F,)))
+        elif typ == 0x40:  # Control Change
+            events.append((tick, 30, 0xB0 | midi_ch, (b2 & 0x7F, b3 & 0x7F)))
+        elif typ == 0x50:  # Polyphonic Key Pressure
+            events.append((tick, 30, 0xA0 | midi_ch, (b2 & 0x7F, b3 & 0x7F)))
+        else:
+            warnings.append(
+                f"{context} +0x{off:04X}: unsupported event "
+                f"{b0:02X} {b1:02X} {b2:02X} {b3:02X}"
+            )
+
+    if tied:
+        warnings.append(
+            f"{context}: unterminated tied note(s): " +
+            ", ".join(
+                f"{n}x{len(tied[n])}" for n in sorted(tied)
+            )
+        )
+
+    return events, warnings, end_tick
+
+
+def build_midi_track(events, name, end_tick=None):
+    out = bytearray()
+    out += meta(0, 0x03, name.encode("ascii", "replace")[:127])
+    prev = 0
+    for tick, priority, status, data in sorted(events, key=lambda x: (x[0], x[1])):
+        if tick < prev:
+            tick = prev
+        out += midi_event(tick - prev, status, data)
+        prev = tick
+    # Keep the native Track End position.  This matters for User Patterns:
+    # without the trailing silence, a loop can restart too early (rush).
+    final_tick = prev if end_tick is None else max(prev, end_tick)
+    out += meta(final_tick - prev, 0x2F)
+    return bytes(out)
+
+
+def conductor_track(name, bpm):
+    out = bytearray()
+    out += meta(0, 0x03, name.encode("ascii", "replace")[:127])
+    usec = round(60_000_000 / max(1, bpm))
+    out += meta(0, 0x51, usec.to_bytes(3, "big"))
+    out += meta(0, 0x58, bytes((4, 2, 24, 8)))
+    out += meta(0, 0x2F)
+    return bytes(out)
+
+
+def make_smf(tracks):
+    hdr = b"MThd" + struct.pack(">IHHH", 6, 1, len(tracks), PPQN)
+    out = bytearray(hdr)
+    for tr in tracks:
+        out += b"MTrk" + struct.pack(">I", len(tr)) + tr
+    return bytes(out)
+
+
+def export_song(ctl, seq, s):
+    a = song_addresses(ctl, s)
+    chs = song_channels(ctl, s)
+    name = song_name(ctl, s)
+    bpm = song_tempo(ctl, s)
+    tracks = [conductor_track(name, bpm)]
+    warnings = []
+    for t in range(16):
+        z = a[t+1] if t < 15 else a[16]
+        raw = seq_slice(seq, a[t], z)
+        ev, w, end_tick = decode_x2_events(raw, chs[t], f"S{s} T{t+1}")
+        warnings.extend(w)
+        tracks.append(build_midi_track(ev, f"T{t+1:02d}", end_tick))
+    return make_smf(tracks), warnings
+
+
+def export_pattern(ctl, seq, p):
+    a = pattern_address(ctl, p)
+    z = pattern_address(ctl, p+1) if p < 99 else pattern_end(ctl)
+    raw = seq_slice(seq, a, z)
+    # Pattern itself has no complete Song/Track context. Preserve note numbers
+    # and wrap the events in a simple 96-PPQN SMF on MIDI channel 1 (index 0).
+    ev, warnings, end_tick = decode_x2_events(raw, 0, f"P{p:02d}")
+    tracks = [
+        conductor_track(f"P{p:02d}", 120),
+        build_midi_track(ev, f"P{p:02d} raw", end_tick)
+    ]
+    return make_smf(tracks), warnings
+
+
+def safe_filename(s):
+    s = "".join(c if c.isalnum() or c in "-_ " else "_" for c in s).strip()
+    return (s or "Song").replace(" ", "_")
+
+
+def export_cmd(args):
+    _, ctl, seq = load_48h(args.input)
+
+    songs = set()
+    patterns = set()
+
+    if args.song:
+        songs.update(parse_selector(args.song, 0, 9, "song"))
+    if args.pattern:
+        patterns.update(parse_selector(args.pattern, 0, 99, "pattern"))
+    if args.songs or args.all:
+        songs.update(s for s in range(10) if song_has_data(ctl, s))
+    if args.patterns or args.all:
+        patterns.update(p for p in range(100) if pattern_has_data(ctl, p))
+
+    if not songs and not patterns:
+        raise ValueError(
+            "no export target selected; use --song, --songs, --pattern, --patterns, or --all"
+        )
+
+    outdir = Path(args.output_dir) if args.output_dir else Path(args.input).with_name(
+        Path(args.input).stem + "_export"
+    )
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    total_warnings = 0
+    for s in sorted(songs):
+        if not song_has_data(ctl, s):
+            print(f"warning: S{s} has no recorded track data", file=sys.stderr)
+        smf, warnings = export_song(ctl, seq, s)
+        fn = outdir / f"S{s}_{safe_filename(song_name(ctl, s))}.mid"
+        fn.write_bytes(smf)
+        print(f"S{s} -> {fn.name}")
+        total_warnings += len(warnings)
+        if warnings and not args.quiet:
+            for w in warnings[:10]:
+                print("  warning:", w, file=sys.stderr)
+            if len(warnings) > 10:
+                print(f"  warning: ... {len(warnings)-10} more", file=sys.stderr)
+
+    for p in sorted(patterns):
+        if not pattern_has_data(ctl, p):
+            print(f"warning: P{p:02d} is empty; skipped", file=sys.stderr)
+            continue
+        smf, warnings = export_pattern(ctl, seq, p)
+        fn = outdir / f"P{p:02d}.mid"
+        fn.write_bytes(smf)
+        print(f"P{p:02d} -> {fn.name}  [raw X2 note map; no GM drum remap]")
+        total_warnings += len(warnings)
+        if warnings and not args.quiet:
+            for w in warnings[:10]:
+                print("  warning:", w, file=sys.stderr)
+            if len(warnings) > 10:
+                print(f"  warning: ... {len(warnings)-10} more", file=sys.stderr)
+
+    if total_warnings:
+        print(f"Completed with {total_warnings} unsupported/unknown event warning(s).")
+
+
+# ---------- analyze ----------
+
+def analyze_cmd(args):
+    msg_header, ctl, seq = load_48h(args.input)
+    print(f"SyX2ool {VERSION} analyze")
+    print(f"File          : {args.input}")
+    print(f"Control Data  : {len(ctl)} bytes")
+    print(f"Sequence Data : {len(seq)} bytes ({len(seq)//16} blocks)")
+    print()
+    print("Songs")
+    print("-----")
+    for s in range(10):
+        a = song_addresses(ctl, s)
+        used = song_has_data(ctl, s)
+        nonempty_tracks = []
+        for t in range(16):
+            z = a[t+1] if t < 15 else a[16]
+            if a[t] < z:
+                nonempty_tracks.append(str(t+1))
+        tr = ",".join(nonempty_tracks) if nonempty_tracks else "-"
+        print(
+            f"S{s}  {'DATA ' if used else 'empty'}  "
+            f"{song_tempo(ctl,s):3d} BPM  "
+            f"name={song_name(ctl,s)!r}  tracks={tr}  "
+            f"T1={a[0]} Tempo={a[16]}"
+        )
+
+    used_patterns = [p for p in range(100) if pattern_has_data(ctl, p)]
+    print()
+    print("Patterns")
+    print("--------")
+    print(f"Used: {len(used_patterns)} / 100")
+    if used_patterns:
+        line = []
+        for p in used_patterns:
+            a = pattern_address(ctl, p)
+            z = pattern_address(ctl, p+1) if p < 99 else pattern_end(ctl)
+            line.append(f"P{p:02d}({z-a} blk)")
+        print(" ".join(line))
+    print(f"Pattern End: {pattern_end(ctl)}")
+
+
+
+# ---------- MIDI playback ----------
+
+def _open_midi_output(spec):
+    if mido is None:
+        raise RuntimeError("mido is required for playback; install with: py -m pip install mido python-rtmidi")
+    names = mido.get_output_names()
+    if not names:
+        raise RuntimeError("no MIDI OUT ports found")
+    if spec is None:
+        if len(names) == 1:
+            name = names[0]
+        else:
+            listing = "\\n".join(f"  {i}: {n}" for i, n in enumerate(names))
+            raise ValueError("multiple MIDI OUT ports found; choose one with --port:\\n" + listing)
+    else:
+        try:
+            idx = int(spec)
+        except ValueError:
+            matches = [n for n in names if spec.lower() in n.lower()]
+            if len(matches) != 1:
+                raise ValueError(f"MIDI OUT port '{spec}' did not match exactly one port")
+            name = matches[0]
+        else:
+            if idx < 0 or idx >= len(names):
+                raise ValueError(f"MIDI OUT port index out of range: {idx}")
+            name = names[idx]
+    return name, mido.open_output(name)
+
+
+def _midi_for_play(args):
+    path = Path(args.input)
+    if path.suffix.lower() in (".syx", ".sys"):
+        if args.pattern is None:
+            raise ValueError("a SysEx input requires --pattern N")
+        if not 0 <= args.pattern <= 99:
+            raise ValueError("pattern must be 0..99")
+        _, ctl, seq = load_48h(path)
+        if not pattern_has_data(ctl, args.pattern):
+            raise ValueError(f"P{args.pattern:02d} is empty")
+        smf, warnings = export_pattern(ctl, seq, args.pattern)
+        if warnings:
+            print(f"warning: {len(warnings)} unsupported/unknown Pattern event(s)", file=sys.stderr)
+        return mido.MidiFile(file=io.BytesIO(smf)), f"P{args.pattern:02d} from {path.name}"
+    if args.pattern is not None:
+        raise ValueError("--pattern is only used with an X2/X3 .syx input")
+    return mido.MidiFile(str(path)), path.name
+
+
+def _build_play_schedule(mid, bpm=None, channel=None):
+    """Return (scheduled_messages, duration_seconds).
+
+    scheduled_messages is a list of (seconds_from_start, message).  Meta events
+    are used for timing/tempo but are not sent.  The final duration includes
+    trailing delta time up to End-of-Track, which is important for patterns.
+    """
+    tempo = mido.bpm2tempo(bpm) if bpm is not None else 500000
+    merged = mido.merge_tracks(mid.tracks)
+    elapsed = 0.0
+    scheduled = []
+    for msg in merged:
+        if msg.time:
+            elapsed += mido.tick2second(msg.time, mid.ticks_per_beat, tempo)
+        if msg.is_meta:
+            if msg.type == "set_tempo" and bpm is None:
+                tempo = msg.tempo
+            continue
+        out = msg
+        if channel is not None and hasattr(msg, "channel"):
+            out = msg.copy(channel=channel - 1)
+        scheduled.append((elapsed, out))
+    return scheduled, elapsed
+
+
+def _sleep_until(deadline):
+    """Sleep against an absolute perf_counter deadline."""
+    while True:
+        remain = deadline - time.perf_counter()
+        if remain <= 0:
+            return
+        # Leave a small final interval to the OS scheduler instead of chaining
+        # relative sleeps from the previous MIDI event.
+        time.sleep(remain if remain < 0.003 else remain - 0.001)
+
+
+def _play_schedule_once(schedule, port, origin, loop_index=0):
+    for offset, msg in schedule:
+        _sleep_until(origin + offset)
+        port.send(msg)
+
+
+def _timing_line(loop_index, expected, actual):
+    err_ms = (actual - expected) * 1000.0
+    print(f"timing loop {loop_index + 1:4d}: expected={expected:.6f}  actual={actual:.6f}  error={err_ms:+.3f} ms")
+
+def ports_cmd(args):
+    if mido is None:
+        raise RuntimeError("mido is required to list MIDI ports; install with: py -m pip install mido python-rtmidi")
+    names = mido.get_output_names()
+    if not names:
+        print("No MIDI OUT ports found.")
+        return
+    print("MIDI OUT ports")
+    print("--------------")
+    for i, name in enumerate(names):
+        print(f"{i}: {name}")
+
+
+
+def _seconds_at_tick(mid, target_tick, bpm=None):
+    """Return elapsed seconds at target_tick, respecting the SMF tempo map."""
+    if bpm is not None:
+        return mido.tick2second(
+            target_tick, mid.ticks_per_beat, mido.bpm2tempo(bpm)
+        )
+
+    tempo = mido.bpm2tempo(120)
+    elapsed = 0.0
+    pos = 0
+    for msg in mido.merge_tracks(mid.tracks):
+        next_pos = pos + msg.time
+        if target_tick <= next_pos:
+            elapsed += mido.tick2second(
+                target_tick - pos, mid.ticks_per_beat, tempo
+            )
+            return elapsed
+        elapsed += mido.tick2second(msg.time, mid.ticks_per_beat, tempo)
+        pos = next_pos
+        if msg.is_meta and msg.type == "set_tempo":
+            tempo = msg.tempo
+
+    if target_tick > pos:
+        elapsed += mido.tick2second(
+            target_tick - pos, mid.ticks_per_beat, tempo
+        )
+    return elapsed
+
+def play_cmd(args):
+    if mido is None:
+        raise RuntimeError("mido is required for playback; install with: py -m pip install mido python-rtmidi")
+    if args.list_ports:
+        names = mido.get_output_names()
+        if not names:
+            print("No MIDI OUT ports found.")
+        else:
+            for i, name in enumerate(names):
+                print(f"{i}: {name}")
+        return
+    if not args.input:
+        raise ValueError("input file is required unless --list-ports is used")
+    if args.bpm is not None and args.bpm <= 0:
+        raise ValueError("BPM must be greater than zero")
+    mid, label = _midi_for_play(args)
+    name, port = _open_midi_output(args.port)
+    print(f"MIDI OUT: {name}")
+    print(f"Playing: {label}" + (f"  BPM={args.bpm:g}" if args.bpm else "") +
+          (f"  CH={args.channel}" if args.channel else ""))
+    if args.loop:
+        print("Loop: ON  (Ctrl+C to stop)")
+    schedule, event_duration = _build_play_schedule(mid, args.bpm, args.channel)
+
+    # Loop boundaries are musical measure boundaries, not the time of the
+    # last MIDI message.  The complete SMF length includes trailing delta time
+    # before End-of-Track.  For --bpm, convert that full tick span at the
+    # requested tempo.
+    merged = mido.merge_tracks(mid.tracks)
+    last_tick = sum(msg.time for msg in merged)
+    if last_tick <= 0:
+        raise ValueError("MIDI duration is zero")
+
+    # Pattern looping must end on a musical bar boundary, not at the last
+    # sounding event. Read the initial time signature (default 4/4), compute
+    # ticks per bar, then round the occupied span up to the next full bar.
+    numerator, denominator = 4, 4
+    for tr in mid.tracks:
+        abs_tick = 0
+        for msg in tr:
+            abs_tick += msg.time
+            if msg.is_meta and msg.type == "time_signature" and abs_tick == 0:
+                numerator, denominator = msg.numerator, msg.denominator
+                break
+
+    ticks_per_bar = mid.ticks_per_beat * numerator * 4 / denominator
+    bars = max(1, int((last_tick + ticks_per_bar - 1) // ticks_per_bar))
+    duration_ticks = int(round(bars * ticks_per_bar))
+
+    # For looping, the next downbeat is anchored to the complete musical
+    # bar boundary.  Without --bpm, respect the file's tempo map all the way
+    # to that boundary.  For one-shot playback, no artificial wait is needed.
+    if args.loop:
+        duration = _seconds_at_tick(mid, duration_ticks, args.bpm)
+    else:
+        duration = event_duration
+
+    if args.timing_log:
+        beats = duration_ticks / mid.ticks_per_beat
+        print(
+            f"Scheduler: absolute perf_counter  duration={duration:.6f} s  "
+            f"last_tick={last_tick}  loop_ticks={duration_ticks}  "
+            f"bars={bars}  time={numerator}/{denominator}  beats={beats:g}"
+        )
+    # One origin for the whole run.  Loop N always starts at origin + N*duration;
+    # a previous loop cannot move the next downbeat earlier or later.
+    origin = time.perf_counter() + 0.050
+    loop_index = 0
+    try:
+        while True:
+            expected = origin + loop_index * duration
+            _sleep_until(expected)
+            actual = time.perf_counter()
+            if args.timing_log:
+                _timing_line(loop_index, expected, actual)
+            _play_schedule_once(schedule, port, expected, loop_index)
+            loop_index += 1
+            if not args.loop:
+                break
+    except KeyboardInterrupt:
+        print("\\nStopped.")
+    finally:
+        try:
+            port.panic()
+        except Exception:
+            pass
+        port.close()
+
+# ---------- CLI ----------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="syx2ool",
+        description=f"SyX2ool v{VERSION} — Korg X2/X3 SysEx & MIDI Toolkit",
+        epilog=(
+            "Quick examples:\n"
+            "  syx2ool import song.mid out.syx\n"
+            "  syx2ool import song.mid out.syx --song 3 --template old.syx\n"
+            "  syx2ool export dump.syx --song 0,3,9\n"
+            "  syx2ool export dump.syx --pattern 0-19,30-35\n"
+            "  syx2ool export dump.syx --all\n"
+            "  syx2ool analyze dump.syx\n"
+            "  syx2ool ports\n"
+            "  syx2ool play song.mid --port 0\n"
+            "  syx2ool play X3DRUMS.syx --pattern 0 --bpm 116 --loop\n\n"
+            "Use 'syx2ool <command> -h' for command-specific help."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--version", action="version", version=f"SyX2ool {VERSION}")
+    sub = p.add_subparsers(dest="command", metavar="{import,export,analyze,ports,play}")
+
+    pi = sub.add_parser(
+        "import",
+        help="convert an SMF to an X2/X3 Song",
+        description=(
+            "Import a Standard MIDI File into an X2/X3 ALL SEQUENCE DATA dump.\n"
+            "The default target is S9; use --song 0..9 to choose another slot.\n"
+            "Without --template, the embedded canonical empty sequencer image is used."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  syx2ool import Physical.mid Physical.syx\n"
+            "  syx2ool import song.mid out.syx --song 3\n"
+            "  syx2ool import song.mid out.syx --song 3 --template existing.syx\n"
+            "  syx2ool import song.mid out.syx --name MYSONG\n\n"
+            "v0.1 import limits: SMF Format 0, 96 PPQN, constant 4/4,\n"
+            "one constant tempo. Existing Songs/Patterns are preserved when\n"
+            "--template is used, except for the selected target Song."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pi.add_argument("input", help="input Standard MIDI File (.mid)")
+    pi.add_argument("output", help="output X2/X3 ALL SEQUENCE DATA SysEx (.syx)")
+    pi.add_argument("-s", "--song", type=int, choices=range(10), default=9,
+                    metavar="N", help="target Song S0..S9 (default: 9)")
+    pi.add_argument("-t", "--template", metavar="DUMP.SYX",
+                    help="existing 48H dump to modify; other Songs/Patterns are preserved")
+    pi.add_argument("-n", "--name", metavar="NAME",
+                    help="override X2/X3 Song Name (maximum 10 characters)")
+    pi.set_defaults(func=import_song)
+
+    pe = sub.add_parser(
+        "export",
+        help="export Songs and/or User Patterns as SMF",
+        description=(
+            "Export selected Songs and User Patterns from an X2/X3 48H dump.\n"
+            "Selectors accept commas and ranges: 0,3,9  /  0-3,7,9.\n"
+            "Pattern MIDI keeps X2/X3 note numbers and does NOT perform GM drum remapping."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  syx2ool export dump.syx --song 9\n"
+            "  syx2ool export dump.syx --song 0,3,9\n"
+            "  syx2ool export dump.syx --song 0-3,7,9\n"
+            "  syx2ool export dump.syx --songs\n"
+            "  syx2ool export dump.syx --pattern 20,21,22\n"
+            "  syx2ool export dump.syx --pattern 0-19,30-35,90-94\n"
+            "  syx2ool export dump.syx --patterns\n"
+            "  syx2ool export dump.syx --all\n\n"
+            "--songs and --patterns select only non-empty objects.\n"
+            "Pattern Put expansion is not yet implemented in v0.1."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pe.add_argument("input", help="input X2/X3 48H ALL SEQUENCE DATA SysEx (.syx)")
+    pe.add_argument("--song", metavar="LIST",
+                    help="Song selection, e.g. 9 or 0,3,9 or 0-3,7,9")
+    pe.add_argument("--songs", action="store_true",
+                    help="export every non-empty Song")
+    pe.add_argument("--pattern", metavar="LIST",
+                    help="Pattern selection, e.g. 20 or 20,21,22 or 0-19,30-35")
+    pe.add_argument("--patterns", action="store_true",
+                    help="export every non-empty User Pattern")
+    pe.add_argument("--all", action="store_true",
+                    help="export every non-empty Song and User Pattern")
+    pe.add_argument("-o", "--output-dir", metavar="DIR",
+                    help="output directory (default: <input_stem>_export)")
+    pe.add_argument("-q", "--quiet", action="store_true",
+                    help="suppress unsupported-event detail warnings")
+    pe.set_defaults(func=export_cmd)
+
+    pa = sub.add_parser(
+        "analyze",
+        help="inspect Song/Track/Pattern layout without modifying the dump",
+        description=(
+            "Inspect an X2/X3 48H ALL SEQUENCE DATA dump.\n"
+            "Shows Song names, tempos, non-empty tracks, addresses and User Pattern usage."
+        ),
+        epilog="Example:\n  syx2ool analyze dump.syx",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pa.add_argument("input", help="input X2/X3 48H ALL SEQUENCE DATA SysEx (.syx)")
+    pa.set_defaults(func=analyze_cmd)
+
+    pports = sub.add_parser(
+        "ports",
+        help="list available MIDI OUT ports",
+        description="List MIDI OUT ports that SyX2ool can use for playback.",
+        epilog="Example:\n  syx2ool ports",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pports.set_defaults(func=ports_cmd)
+
+    pp = sub.add_parser(
+        "play",
+        help="play an SMF or X2/X3 User Pattern through MIDI OUT",
+        description=(
+            "Play a Standard MIDI File through a MIDI OUT port, or play one User Pattern\n"
+            "directly from an X2/X3 48H ALL SEQUENCE DATA SysEx dump. SMF MIDI channels\n"
+            "are preserved unless --channel is specified."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  syx2ool ports\n  syx2ool play --list-ports\n"
+            "  syx2ool play song.mid --port 0\n"
+            "  syx2ool play P00.mid --port 0 --bpm 116 --loop\n"
+            "  syx2ool play P00.mid --port 0 --channel 1\n"
+            "  syx2ool play X3DRUMS.syx --pattern 0 --port 0 --bpm 116 --loop\n\n"
+            "--bpm overrides SMF tempo while preserving tick timing.\n"
+            "--channel remaps all channel messages to one MIDI channel; omit it for GM files.\n"
+            "--timing-log prints absolute scheduler diagnostics at each loop boundary.\n"
+            "Ctrl+C stops playback; All Notes Off is sent on exit."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    pp.add_argument("input", nargs="?", help="input Standard MIDI File (.mid) or X2/X3 48H dump (.syx)")
+    pp.add_argument("--pattern", type=int, metavar="N", help="with .syx input, play User Pattern P00..P99")
+    pp.add_argument("--port", metavar="PORT", help="MIDI OUT port index or unique name substring")
+    pp.add_argument("--list-ports", action="store_true", help="list available MIDI OUT ports and exit")
+    pp.add_argument("--bpm", type=float, metavar="BPM", help="override SMF tempo")
+    pp.add_argument("--channel", type=int, choices=range(1,17), metavar="CH", help="remap all channel messages to CH1..CH16")
+    pp.add_argument("--loop", action="store_true", help="repeat until Ctrl+C")
+    pp.add_argument("--timing-log", action="store_true", help="print each loop boundary expected/actual time and error")
+    pp.set_defaults(func=play_cmd)
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return 0
+    try:
+        args.func(args)
+        return 0
+    except Exception as e:
+        print(f"syx2ool: error: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
