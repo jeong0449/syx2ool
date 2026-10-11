@@ -811,7 +811,7 @@ def _open_midi_output(spec):
             name = names[0]
         else:
             listing = "\\n".join(f"  {i}: {n}" for i, n in enumerate(names))
-            raise ValueError("multiple MIDI OUT ports found; choose one with --port:\\n" + listing)
+            raise ValueError("multiple MIDI OUT ports found; choose one with --out-port:\\n" + listing)
     else:
         try:
             idx = int(spec)
@@ -958,7 +958,7 @@ def play_cmd(args):
     if args.bpm is not None and args.bpm <= 0:
         raise ValueError("BPM must be greater than zero")
     mid, label = _midi_for_play(args)
-    name, port = _open_midi_output(args.port)
+    name, port = _open_midi_output(args.out_port)
     print(f"MIDI OUT: {name}")
     print(f"Playing: {label}" + (f"  BPM={args.bpm:g}" if args.bpm else "") +
           (f"  CH={args.channel}" if args.channel else ""))
@@ -1654,7 +1654,7 @@ def build_parser():
             "  syx2ool export dump.syx --all\n"
             "  syx2ool analyze dump.syx\n"
             "  syx2ool ports\n"
-            "  syx2ool play song.mid --port 0\n"
+            "  syx2ool play song.mid --out-port 0\n"
             "  syx2ool play X3DRUMS.syx --pattern 0 --bpm 116 --loop\n"
             "  syx2ool send dump.syx --out-port 0 --in-port 0\n"
             "  syx2ool receive captured.syx --in-port 0\n\n"
@@ -1768,10 +1768,10 @@ def build_parser():
         epilog=(
             "Examples:\n"
             "  syx2ool ports\n  syx2ool play --list-ports\n"
-            "  syx2ool play song.mid --port 0\n"
-            "  syx2ool play P00.mid --port 0 --bpm 116 --loop\n"
-            "  syx2ool play P00.mid --port 0 --channel 1\n"
-            "  syx2ool play X3DRUMS.syx --pattern 0 --port 0 --bpm 116 --loop\n\n"
+            "  syx2ool play song.mid --out-port 0\n"
+            "  syx2ool play P00.mid --out-port 0 --bpm 116 --loop\n"
+            "  syx2ool play P00.mid --out-port 0 --channel 1\n"
+            "  syx2ool play X3DRUMS.syx --pattern 0 --out-port 0 --bpm 116 --loop\n\n"
             "--bpm overrides SMF tempo while preserving tick timing.\n"
             "--channel remaps all channel messages to one MIDI channel; omit it for GM files.\n"
             "--timing-log prints absolute scheduler diagnostics at each loop boundary.\n"
@@ -1781,7 +1781,7 @@ def build_parser():
     )
     pp.add_argument("input", nargs="?", help="input Standard MIDI File (.mid) or X2/X3 48H dump (.syx)")
     pp.add_argument("--pattern", type=int, metavar="N", help="with .syx input, play User Pattern P00..P99")
-    pp.add_argument("--port", metavar="PORT", help="MIDI OUT port index or unique name substring")
+    pp.add_argument("--out-port", "--port", dest="out_port", metavar="PORT", help="MIDI OUT port index or unique name substring (--port is a compatibility alias)")
     pp.add_argument("--list-ports", action="store_true", help="list available MIDI OUT ports and exit")
     pp.add_argument("--bpm", type=float, metavar="BPM", help="override SMF tempo")
     pp.add_argument("--channel", type=int, choices=range(1,17), metavar="CH", help="remap all channel messages to CH1..CH16")
