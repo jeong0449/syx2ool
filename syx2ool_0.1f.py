@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SyX2ool v0.1e — Korg X2/X3 SysEx & MIDI Toolkit
+SyX2ool v0.1f — Korg X2/X3 SysEx & MIDI Toolkit
 
 Subcommands
 -----------
