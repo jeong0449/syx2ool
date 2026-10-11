@@ -31,7 +31,7 @@ kept, it made it possible to convert disk-based data into SysEx form and
 send it to the synthesizer.
 
 This became particularly important when I replaced the X2's internal
-backup battery. After the battery replacement, the **Preload Data disk
+backup battery. After the battery replacement, the **Factory Preload Data disk
 had to be loaded to restore the factory data needed to make the
 instrument properly usable again**. With a non-working floppy drive,
 however, the normal disk-based restoration procedure was no longer
