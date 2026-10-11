@@ -28,6 +28,8 @@ floppy disks.
 -   Play X2/X3 Patterns directly from a SysEx dump
 -   Loop Patterns on musical bar boundaries
 -   List available MIDI ports
+-   Send X2/X3 SysEx dumps and monitor ACK/NAK responses
+-   Receive and save large X2/X3 SysEx dumps
 
 Some parts of the proprietary X2/X3 sequencer format were determined
 experimentally and may not yet be completely understood.
@@ -151,9 +153,20 @@ including real-time Pattern performance and arrangement.
 
 ## Status
 
-syx2ool is experimental software. Keep backups of original SysEx and
-SNG data and test generated data carefully. Hardware testing to date has
-primarily been performed with a Korg X2.
+SyX2ool is experimental software. Keep backups of original SysEx and
+SNG data and test generated data carefully.
+
+Hardware testing has been performed with a Korg X2 connected through
+a Mackie Onyx Producer 2•2 MIDI interface on Windows. In testing,
+SyX2ool successfully received a single 220,903-byte ALL DATA DUMP
+(50H) from the X2, saved it to a file, transmitted the same dump back
+to the synthesizer, and received an ACK (23H) confirming successful
+processing.
+
+Large SysEx transfer has therefore been verified on Windows with this
+hardware configuration. The program is designed to use Mido and
+python-rtmidi on other platforms as well, but large SysEx transfer has
+not yet been verified with actual X2/X3 hardware on Linux or macOS.
 
 ## License
 
