@@ -7,8 +7,16 @@ The name **SyX2ool** is a combination of **SysEx + X2 + Tool**. The
 project grew out of experiments with Korg X2/X3 sequencer dumps,
 Standard MIDI Files (SMF), drum patterns, and real-time MIDI playback.
 
+SyX2ool is particularly useful for an X2/X3 whose floppy disk drive is
+no longer usable. In such a situation, transferring data over a MIDI
+connection using SysEx can provide a practical way to move sequencer
+data between the synthesizer and a modern computer without relying on
+floppy disks.
+
 > This is an experimental, unofficial project and is not affiliated with
-> Korg.
+> Korg. Historical Korg X2/X3 disk files used during the development of
+> this project are not included in this repository. If you are researching
+> these legacy formats, please contact the author.
 
 ## Features
 
