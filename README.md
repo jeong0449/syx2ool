@@ -20,16 +20,16 @@ floppy disks.
 
 ## Features
 
--   Import an SMF into an X2/X3 Song
--   Export Songs from an ALL SEQUENCE DATA SysEx dump as SMF
--   Export X2/X3 User Patterns as SMF
--   Analyze X2/X3 sequencer SysEx data
--   Play ordinary MIDI files through a MIDI OUT port
--   Play X2/X3 Patterns directly from a SysEx dump
--   Loop Patterns on musical bar boundaries
--   List available MIDI ports
--   Send X2/X3 SysEx dumps and monitor ACK/NAK responses
--   Receive and save large X2/X3 SysEx dumps
+- Import an SMF into X2/X3 Song SysEx data (S9)
+- Export X2/X3 Songs from ALL SEQUENCE DATA SysEx as SMF
+- Export X2/X3 User Patterns from ALL SEQUENCE DATA SysEx as SMF
+- Analyze X2/X3 sequencer SysEx data
+- Play SMF files through a MIDI OUT port
+- Play X2/X3 User Patterns directly from ALL SEQUENCE DATA SysEx
+- Loop X2/X3 User Patterns on musical bar boundaries
+- List available MIDI input and output ports
+- Send X2/X3 SysEx files and monitor ACK/NAK responses
+- Receive and save large X2/X3 SysEx transfers
 
 Some parts of the proprietary X2/X3 sequencer format were determined
 experimentally and may not yet be completely understood.
